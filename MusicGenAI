@@ -1,0 +1,130 @@
+import os
+import numpy as np
+from music21 import converter, instrument, note, chord, stream
+from keras.models import Sequential, load_model
+from keras.layers import LSTM, Dropout, Dense, Activation
+from keras.utils import to_categorical
+import glob
+import random
+
+# Step 1: Load All MIDI Files
+notes = []
+midi_files = glob.glob("C:\\Users\\vasan\\OneDrive\\Desktop\\CodeAlpha\\mid_songs\\*.mid")
+
+for file in midi_files:
+    try:
+        midi = converter.parse(file)
+        parts = instrument.partitionByInstrument(midi)
+        if parts:
+            notes_to_parse = parts.parts[0].recurse()
+        else:
+            notes_to_parse = midi.flat.notes
+
+        for element in notes_to_parse:
+            if isinstance(element, note.Note):
+                notes.append(str(element.pitch) + "_" + str(element.quarterLength))
+            elif isinstance(element, chord.Chord):
+                chord_str = '.'.join(str(n) for n in element.normalOrder)
+                notes.append(chord_str + "_" + str(element.quarterLength))
+
+        print(f"✅ Loaded: {file}")
+
+    except Exception as e:
+        print(f"❌ Skipped: {file} due to {e}")
+        continue
+
+if len(notes) < 20:
+    print("🚫 Not enough valid notes to train. Please add more MIDI files.")
+    exit()
+
+# Step 2: Prepare Sequences
+sequence_length = 50
+pitchnames = sorted(set(notes))
+n_vocab = len(pitchnames)
+note_to_int = dict((note, number) for number, note in enumerate(pitchnames))
+
+network_input = []
+network_output = []
+
+for i in range(len(notes) - sequence_length):
+    seq_in = notes[i:i + sequence_length]
+    seq_out = notes[i + sequence_length]
+    network_input.append([note_to_int[n] for n in seq_in])
+    network_output.append(note_to_int[seq_out])
+
+n_patterns = len(network_input)
+network_input = np.reshape(network_input, (n_patterns, sequence_length, 1))
+network_input = network_input / float(n_vocab)
+network_output = to_categorical(network_output, num_classes=n_vocab)
+
+# Step 3: Build or Load Model
+if os.path.exists("AI_model.h5"):
+    print("📦 Found saved model. Loading...")
+    model = load_model("AI_model.h5")
+else:
+    print("🛠 No saved model found. Building and training one now...")
+    model = Sequential()
+    model.add(LSTM(512, input_shape=(network_input.shape[1], network_input.shape[2]), return_sequences=True))
+    model.add(Dropout(0.3))
+    model.add(LSTM(512))
+    model.add(Dense(256))
+    model.add(Dropout(0.3))
+    model.add(Dense(n_vocab))
+    model.add(Activation('softmax'))
+    model.compile(loss='categorical_crossentropy', optimizer='adam')
+
+    print("\n⏳ Training on MIDI songs...")
+    model.fit(network_input, network_output, epochs=100, batch_size=64)
+    model.save("AI_model.h5")
+    print("✅ Model trained and saved!")
+
+# Step 4: Generate Music
+start = np.random.randint(0, len(network_input) - 1)
+pattern = network_input[start].tolist()
+int_to_note = dict((number, note) for number, note in enumerate(pitchnames))
+prediction_output = []
+
+print("🎶 Generating music...")
+
+for note_index in range(300):
+    prediction_input = np.reshape(pattern, (1, len(pattern), 1))
+    prediction_input = prediction_input / float(n_vocab)
+
+    prediction = model.predict(prediction_input, verbose=0)
+    index = np.argmax(prediction)
+    result = int_to_note[index]
+    prediction_output.append(result)
+
+    pattern.append([index])
+    pattern = pattern[1:len(pattern)]
+
+# Step 5: Convert Predictions to MIDI
+offset = 0
+output_notes = []
+
+for pattern in prediction_output:
+    if "_" not in pattern:
+        continue
+    try:
+        name, duration = pattern.split("_")
+        duration = float(duration)
+    except:
+        continue
+
+    if '.' in name or name.isdigit():
+        chord_notes = [note.Note(int(n)) for n in name.split('.')]
+        new_chord = chord.Chord(chord_notes)
+        new_chord.offset = offset
+        new_chord.duration.quarterLength = duration
+        output_notes.append(new_chord)
+    else:
+        new_note = note.Note(name)
+        new_note.offset = offset
+        new_note.duration.quarterLength = duration
+        output_notes.append(new_note)
+
+    offset += duration
+
+midi_stream = stream.Stream(output_notes)
+midi_stream.write('midi', fp='AI_generated.mid')
+print("✅ New song saved as 'AI_generated.mid'")
